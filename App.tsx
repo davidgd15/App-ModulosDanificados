@@ -26,9 +26,9 @@ import {
   collection,
   addDoc,
   query,
-  where,
   orderBy,
   onSnapshot,
+  getDocs,
 } from 'firebase/firestore';
 import { getAuth, signInAnonymously } from 'firebase/auth';
 import NetInfo from '@react-native-community/netinfo';
@@ -59,6 +59,7 @@ type DamagedContextType = {
   codesSet: Set<string>;
   loading: boolean;
   syncError: string | null;
+  isOnline: boolean;
   retryInitialLoad: () => void;
   addModule: (usina: string, sub: string, code: string) => Promise<boolean>;
 };
@@ -68,6 +69,7 @@ const DamagedContext = createContext<DamagedContextType>({
   codesSet: new Set(),
   loading: true,
   syncError: null,
+  isOnline: false,
   retryInitialLoad: () => {},
   addModule: async () => false,
 });
@@ -83,6 +85,7 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
   const [pendingQueue, setPendingQueue] = useState<DamagedModule[]>([]);
   const [isOnline, setIsOnline] = useState(false);
   const isSyncing = useRef(false);
+  const listenerUnsubscribe = useRef<(() => void) | null>(null);
 
   // ---- Persistência ----
   const loadPendingFromStorage = async (): Promise<DamagedModule[]> => {
@@ -94,14 +97,63 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
     await AsyncStorage.setItem('@pending_damaged', JSON.stringify(queue));
   };
 
-  // ---- Sincronizar pendentes ----
+  // ---- Recarregar base do Firestore (usado antes de sincronizar) ----
+  const refreshFirestoreData = async (): Promise<{ modules: DamagedModule[]; codes: Set<string> }> => {
+    const q = query(collection(db, 'ModulosDanificados'), orderBy('timestamp', 'desc'));
+    const snapshot = await getDocs(q);
+    const freshModules: DamagedModule[] = [];
+    const freshCodes = new Set<string>();
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      freshModules.push({
+        id: doc.id,
+        code: data.code,
+        usina: data.usina,
+        subarea: data.subarea,
+        timestamp: data.timestamp,
+        pending: false,
+      });
+      freshCodes.add(data.code);
+    });
+    return { modules: freshModules, codes: freshCodes };
+  };
+
+  // ---- Sincronizar pendentes com verificação prévia de duplicidade ----
   const syncPending = useCallback(async (queue: DamagedModule[]) => {
     if (!isOnline || queue.length === 0 || isSyncing.current) return;
     isSyncing.current = true;
 
+    // Antes de enviar, recarrega a base do Firestore para ter os códigos mais recentes
+    let freshCodes: Set<string>;
+    try {
+      const fresh = await refreshFirestoreData();
+      freshCodes = fresh.codes;
+      // Atualiza o estado local com os dados oficiais, mantendo pendentes ainda não sincronizados
+      setModules((prev) => {
+        const stillPending = prev.filter(m => m.pending && !freshCodes.has(m.code));
+        return [...stillPending, ...fresh.modules].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      });
+      setCodesSet((prev) => {
+        const combined = new Set(prev);
+        freshCodes.forEach(c => combined.add(c));
+        return combined;
+      });
+    } catch (error) {
+      console.error('Erro ao recarregar base antes de sincronizar:', error);
+      // Se falhar, usa o codesSet atual (melhor que nada)
+      freshCodes = new Set(codesSet);
+    }
+
     const remaining: DamagedModule[] = [];
 
     for (const mod of queue) {
+      // Se o código já existe no servidor (recém-baixado), não envia e remove da fila
+      if (freshCodes.has(mod.code)) {
+        // Remove da lista local (some o amarelo, pois já está no servidor)
+        setModules((prev) => prev.filter(m => m.code !== mod.code || !m.pending));
+        continue;
+      }
+
       try {
         const docRef = await addDoc(collection(db, 'ModulosDanificados'), {
           code: mod.code,
@@ -109,14 +161,14 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
           subarea: mod.subarea,
           timestamp: mod.timestamp,
         });
-
+        // Atualiza o módulo local: deixa de ser pendente
         setModules((prev) =>
           prev.map((m) =>
-            m.code === mod.code && m.pending
-              ? { ...m, id: docRef.id, pending: false }
-              : m
+            m.code === mod.code && m.pending ? { ...m, id: docRef.id, pending: false } : m
           )
         );
+        // Adiciona o código ao Set para futuras verificações
+        freshCodes.add(mod.code);
       } catch (error) {
         console.error('Erro ao sincronizar:', mod.code, error);
         remaining.push(mod);
@@ -126,7 +178,7 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
     await savePendingToStorage(remaining);
     setPendingQueue(remaining);
     isSyncing.current = false;
-  }, [isOnline]);
+  }, [isOnline, codesSet]);
 
   // ---- Listener único do Firestore ----
   const startListener = () => {
@@ -177,62 +229,90 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
       setLoading(false);
     });
 
-    return unsubscribe;
+    listenerUnsubscribe.current = unsubscribe;
   };
-
-  const listenerUnsubscribe = useRef<(() => void) | null>(null);
 
   const retryInitialLoad = () => {
     if (listenerUnsubscribe.current) {
       listenerUnsubscribe.current();
     }
-    listenerUnsubscribe.current = startListener();
+    startListener();
   };
 
-  // ---- Adicionar módulo (offline-first) ----
+  // ---- Adicionar módulo (comportamento dual) ----
   const addModule = useCallback(async (usina: string, sub: string, code: string): Promise<boolean> => {
+    // Verifica duplicidade local (inclui pendentes e oficiais)
     if (codesSet.has(code)) return false;
 
     const now = new Date();
     const timestamp = formatDateTime(now);
-    const newMod: DamagedModule = {
-      code,
-      usina,
-      subarea: sub,
-      timestamp,
-      pending: true,
-    };
-
-    const updatedModules = [...modules, newMod].sort(
-      (a, b) => b.timestamp.localeCompare(a.timestamp)
-    );
-    setModules(updatedModules);
-    const newCodes = new Set(codesSet);
-    newCodes.add(code);
-    setCodesSet(newCodes);
-
-    const updatedQueue = [...pendingQueue, newMod];
-    await savePendingToStorage(updatedQueue);
-    setPendingQueue(updatedQueue);
 
     if (isOnline) {
-      syncPending(updatedQueue);
-    }
+      // Online: salva direto no Firestore (sem pendente)
+      try {
+        const docRef = await addDoc(collection(db, 'ModulosDanificados'), {
+          code,
+          usina,
+          subarea: sub,
+          timestamp,
+        });
+        // Adiciona localmente como módulo oficial (sem fundo amarelo)
+        const newMod: DamagedModule = {
+          id: docRef.id,
+          code,
+          usina,
+          subarea: sub,
+          timestamp,
+          pending: false,
+        };
+        setModules((prev) => [...prev, newMod].sort((a, b) => b.timestamp.localeCompare(a.timestamp)));
+        const newCodes = new Set(codesSet);
+        newCodes.add(code);
+        setCodesSet(newCodes);
+        return true;
+      } catch (error) {
+        console.error('Erro ao salvar online:', error);
+        Alert.alert('Erro', 'Falha ao salvar no servidor. Tente novamente.');
+        return false;
+      }
+    } else {
+      // Offline: salva localmente e mostra alerta
+      const newMod: DamagedModule = {
+        code,
+        usina,
+        subarea: sub,
+        timestamp,
+        pending: true,
+      };
+      const updatedModules = [...modules, newMod].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      setModules(updatedModules);
+      const newCodes = new Set(codesSet);
+      newCodes.add(code);
+      setCodesSet(newCodes);
 
-    return true;
-  }, [modules, codesSet, pendingQueue, isOnline, syncPending]);
+      const updatedQueue = [...pendingQueue, newMod];
+      await savePendingToStorage(updatedQueue);
+      setPendingQueue(updatedQueue);
+
+      Alert.alert('Salvo offline', 'O módulo foi salvo localmente e será enviado quando houver internet.');
+      return true;
+    }
+  }, [modules, codesSet, pendingQueue, isOnline]);
 
   // ---- Monitoramento de conexão ----
   useEffect(() => {
     const unsubscribeNet = NetInfo.addEventListener((state) => {
       const online = !!(state.isConnected && state.isInternetReachable);
+      const wasOffline = !isOnline;
       setIsOnline(online);
-      if (online) {
+
+      // Se acabou de voltar a internet, dispara sincronização
+      if (online && wasOffline && pendingQueue.length > 0) {
         syncPending(pendingQueue);
       }
     });
     return () => unsubscribeNet();
-  }, [pendingQueue, syncPending]);
+  }, [pendingQueue, isOnline, syncPending]);
 
   // ---- Inicialização ----
   useEffect(() => {
@@ -250,7 +330,7 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
       }
     };
     init();
-    listenerUnsubscribe.current = startListener();
+    startListener();
     return () => {
       if (listenerUnsubscribe.current) {
         listenerUnsubscribe.current();
@@ -265,6 +345,7 @@ function DamagedProvider({ children }: { children: React.ReactNode }) {
         codesSet,
         loading,
         syncError,
+        isOnline,
         retryInitialLoad,
         addModule,
       }}
@@ -291,12 +372,23 @@ const formatDateTime = (date: Date): string => {
 
 // ==================== TELA REGISTRAR ====================
 function RegistrarScreen() {
-  const { modules, codesSet, loading, syncError, addModule } = useDamaged();
+  const { modules, codesSet, loading, syncError, addModule, isOnline } = useDamaged();
   const [selectedUsina, setSelectedUsina] = useState('');
   const [selectedSub, setSelectedSub] = useState('');
   const [codeInput, setCodeInput] = useState('');
   const [saving, setSaving] = useState(false);
   const inputRef = useRef<TextInput>(null);
+
+  // Foco automático assim que usina e subárea são selecionadas
+  useEffect(() => {
+    if (selectedUsina !== '' && selectedSub !== '') {
+      // Pequeno atraso para garantir que o input esteja renderizado
+      const timer = setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [selectedUsina, selectedSub]);
 
   const filteredModules = modules.filter(
     (m) => m.usina === selectedUsina && m.subarea === selectedSub
@@ -433,31 +525,47 @@ function RegistrarScreen() {
 // ==================== TELA TODOS ====================
 function TodosScreen() {
   const { modules, loading, syncError, retryInitialLoad } = useDamaged();
-  const [modalVisible, setModalVisible] = useState(false);
+  const [usinaModalVisible, setUsinaModalVisible] = useState(false);
+  const [selectedUsinaSubareas, setSelectedUsinaSubareas] = useState<
+    { title: string; modules: DamagedModule[] }[]
+  >([]);
+  const [selectedUsinaName, setSelectedUsinaName] = useState('');
+  const [subareaModalVisible, setSubareaModalVisible] = useState(false);
   const [selectedModules, setSelectedModules] = useState<DamagedModule[]>([]);
   const [selectedTitle, setSelectedTitle] = useState('');
 
-  // Agrupa módulos por usina e depois por subarea
+  // Agrupa módulos: usina → subarea → módulos
   const groupedByUsina: Record<string, Record<string, DamagedModule[]>> = {};
   modules.forEach((mod) => {
     if (!groupedByUsina[mod.usina]) groupedByUsina[mod.usina] = {};
-    if (!groupedByUsina[mod.usina][mod.subarea]) groupedByUsina[mod.usina][mod.subarea] = [];
+    if (!groupedByUsina[mod.usina][mod.subarea])
+      groupedByUsina[mod.usina][mod.subarea] = [];
     groupedByUsina[mod.usina][mod.subarea].push(mod);
   });
 
-  // Transforma em estrutura para renderização: lista de usinas, cada uma com lista de subareas
-  const usinaCards = Object.entries(groupedByUsina).map(([usina, subareas]) => ({
-    usina,
-    subareas: Object.entries(subareas).map(([subarea, mods]) => ({
-      title: `${usina} - ${subarea}`,
+  const usinaCards = Object.entries(groupedByUsina).map(([usina, subareas]) => {
+    const totalModulos = Object.values(subareas).reduce(
+      (sum, mods) => sum + mods.length,
+      0
+    );
+    const subareasList = Object.entries(subareas).map(([sub, mods]) => ({
+      title: `${usina} - ${sub}`,
       modules: mods,
-    })),
-  }));
+    }));
+    return { usina, totalModulos, subareas: subareasList };
+  });
 
-  const openDetails = (title: string, mods: DamagedModule[]) => {
+  const openUsinaModal = (usina: string, subareas: { title: string; modules: DamagedModule[] }[]) => {
+    setSelectedUsinaName(usina);
+    setSelectedUsinaSubareas(subareas);
+    setUsinaModalVisible(true);
+  };
+
+  const openSubareaModal = (title: string, mods: DamagedModule[]) => {
+    setUsinaModalVisible(false);
     setSelectedTitle(title);
     setSelectedModules(mods);
-    setModalVisible(true);
+    setSubareaModalVisible(true);
   };
 
   if (loading) {
@@ -481,24 +589,20 @@ function TodosScreen() {
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Todos os Módulos Danificados</Text>
+
       <FlatList
         data={usinaCards}
         keyExtractor={(item) => item.usina}
-        renderItem={({ item: usinaItem }) => (
-          <View style={styles.usinaSection}>
-            <Text style={styles.usinaSectionTitle}>{usinaItem.usina}</Text>
-            {usinaItem.subareas.map((subareaItem) => (
-              <View key={subareaItem.title} style={styles.card}>
-                <Text style={styles.cardTitle}>{subareaItem.title}</Text>
-                <Text style={styles.cardSubtitle}>
-                  {subareaItem.modules.length} módulo(s)
-                </Text>
-                <Button
-                  title="Detalhes"
-                  onPress={() => openDetails(subareaItem.title, subareaItem.modules)}
-                />
-              </View>
-            ))}
+        renderItem={({ item }) => (
+          <View style={styles.usinaCard}>
+            <Text style={styles.usinaCardTitle}>{item.usina}</Text>
+            <Text style={styles.usinaCardSubtitle}>
+              {item.totalModulos} módulo(s) no total
+            </Text>
+            <Button
+              title="Detalhes"
+              onPress={() => openUsinaModal(item.usina, item.subareas)}
+            />
           </View>
         )}
         ListEmptyComponent={
@@ -506,8 +610,43 @@ function TodosScreen() {
         }
       />
 
-      {/* Modal de detalhes da subárea */}
-      <Modal visible={modalVisible} animationType="slide" onRequestClose={() => setModalVisible(false)}>
+      <Modal
+        visible={usinaModalVisible}
+        animationType="slide"
+        onRequestClose={() => setUsinaModalVisible(false)}
+      >
+        <View style={styles.modalContainer}>
+          <Text style={styles.modalTitle}>Subáreas de {selectedUsinaName}</Text>
+          <FlatList
+            data={selectedUsinaSubareas}
+            keyExtractor={(item) => item.title}
+            renderItem={({ item }) => (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>{item.title}</Text>
+                <Text style={styles.cardSubtitle}>
+                  {item.modules.length} módulo(s)
+                </Text>
+                <Button
+                  title="Detalhes"
+                  onPress={() => openSubareaModal(item.title, item.modules)}
+                />
+              </View>
+            )}
+            ListEmptyComponent={
+              <Text style={styles.emptyText}>Nenhuma subárea encontrada.</Text>
+            }
+          />
+          <View style={{ marginTop: 12 }}>
+            <Button title="Fechar" onPress={() => setUsinaModalVisible(false)} />
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={subareaModalVisible}
+        animationType="slide"
+        onRequestClose={() => setSubareaModalVisible(false)}
+      >
         <View style={styles.modalContainer}>
           <Text style={styles.modalTitle}>{selectedTitle}</Text>
           <FlatList
@@ -523,7 +662,9 @@ function TodosScreen() {
               <Text style={styles.emptyText}>Nenhum módulo.</Text>
             }
           />
-          <Button title="Fechar" onPress={() => setModalVisible(false)} />
+          <View style={{ marginTop: 12 }}>
+            <Button title="Fechar" onPress={() => setSubareaModalVisible(false)} />
+          </View>
         </View>
       </Modal>
     </View>
@@ -625,6 +766,24 @@ const styles = StyleSheet.create({
   moduleDate: { fontSize: 14, color: '#555' },
   emptyText: { textAlign: 'center', marginTop: 20, color: '#888' },
   errorText: { fontSize: 18, color: '#d32f2f', textAlign: 'center', marginBottom: 12 },
+  usinaCard: {
+    backgroundColor: '#e3f2fd',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    elevation: 3,
+  },
+  usinaCardTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#0d47a1',
+    marginBottom: 4,
+  },
+  usinaCardSubtitle: {
+    fontSize: 14,
+    color: '#1565c0',
+    marginBottom: 8,
+  },
   card: {
     backgroundColor: '#fff',
     borderRadius: 12,
@@ -645,14 +804,4 @@ const styles = StyleSheet.create({
   },
   modalContainer: { flex: 1, padding: 20, backgroundColor: '#fff' },
   modalTitle: { fontSize: 22, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
-    usinaSection: {
-    marginBottom: 20,
-  },
-  usinaSectionTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    color: '#1976d2',
-    marginBottom: 8,
-    paddingLeft: 4,
-  },
 });
